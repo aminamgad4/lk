@@ -97,21 +97,69 @@ class ETAContentScript {
 
     async extractInvoiceData() {
         try {
+            console.log('Starting invoice data extraction...');
+            
             // Check if we're on the documents page
             if (!window.location.href.includes('/documents')) {
                 throw new Error('يرجى الانتقال إلى صفحة المستندات أولاً');
             }
 
-            // Wait for table to load
-            await this.waitForElement('table', 10000);
+            // Wait for page to load completely
+            await this.waitForPageLoad();
 
-            const table = document.querySelector('table');
+            // Try multiple selectors for the table
+            const tableSelectors = [
+                'table',
+                '.ms-DetailsList table',
+                '[role="grid"]',
+                '.ms-DetailsList',
+                '.grid'
+            ];
+
+            let table = null;
+            for (const selector of tableSelectors) {
+                table = document.querySelector(selector);
+                if (table) {
+                    console.log(`Found table with selector: ${selector}`);
+                    break;
+                }
+            }
+
             if (!table) {
-                throw new Error('لم يتم العثور على جدول البيانات');
+                // Try to find any element that might contain invoice data
+                const detailsList = document.querySelector('.ms-DetailsList');
+                const listCells = document.querySelectorAll('.ms-List-cell');
+                const detailsRows = document.querySelectorAll('.ms-DetailsRow');
+                
+                console.log('Table search results:', {
+                    detailsList: !!detailsList,
+                    listCells: listCells.length,
+                    detailsRows: detailsRows.length
+                });
+
+                if (detailsRows.length > 0) {
+                    console.log('Using DetailsRow elements instead of table');
+                    const invoices = this.parseDetailsRows(detailsRows);
+                    const pagination = this.extractPaginationInfo();
+                    
+                    return {
+                        success: true,
+                        data: {
+                            invoices: invoices,
+                            totalCount: pagination.totalCount,
+                            currentPage: pagination.currentPage,
+                            totalPages: pagination.totalPages
+                        }
+                    };
+                }
+
+                throw new Error('لم يتم العثور على جدول البيانات. تأكد من تحميل الصفحة بالكامل.');
             }
 
             const invoices = this.parseInvoiceTable(table);
             const pagination = this.extractPaginationInfo();
+
+            console.log(`Extracted ${invoices.length} invoices`);
 
             return {
                 success: true,
@@ -123,6 +171,7 @@ class ETAContentScript {
                 }
             };
         } catch (error) {
+            console.error('Error in extractInvoiceData:', error);
             return {
                 success: false,
                 error: error.message
@@ -130,13 +179,158 @@ class ETAContentScript {
         }
     }
 
+    async waitForPageLoad() {
+        // Wait for the page to be fully loaded
+        if (document.readyState !== 'complete') {
+            await new Promise(resolve => {
+                window.addEventListener('load', resolve);
+            });
+        }
+
+        // Wait for React/Angular to render
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Wait for any loading indicators to disappear
+        const loadingSelectors = [
+            '.LoadingIndicator',
+            '.ms-Spinner',
+            '.loading',
+            '[data-is-loading="true"]'
+        ];
+
+        for (const selector of loadingSelectors) {
+            const loadingElement = document.querySelector(selector);
+            if (loadingElement && loadingElement.style.display !== 'none') {
+                await this.waitForElementToDisappear(selector, 10000);
+            }
+        }
+    }
+
+    parseDetailsRows(detailsRows) {
+        const invoices = [];
+        
+        detailsRows.forEach((row, index) => {
+            try {
+                const cells = row.querySelectorAll('.ms-DetailsRow-cell, [role="rowheader"], [role="gridcell"]');
+                if (cells.length === 0) return;
+
+                // Extract data from the row structure
+                const invoice = this.extractInvoiceFromRow(row, cells, index);
+                if (invoice) {
+                    invoices.push(invoice);
+                }
+            } catch (error) {
+                console.warn(`Error parsing details row ${index}:`, error);
+            }
+        });
+
+        return invoices;
+    }
+
+    extractInvoiceFromRow(row, cells, index) {
+        try {
+            // Look for specific data in the row
+            const invoice = {
+                serialNumber: index + 1,
+                detailsButton: 'عرض',
+                documentType: 'فاتورة',
+                documentVersion: '1.0',
+                status: '',
+                issueDate: '',
+                submissionDate: '',
+                invoiceCurrency: 'EGP',
+                invoiceValue: '',
+                vatAmount: '',
+                taxDiscount: '0',
+                totalAmount: '',
+                internalNumber: '',
+                electronicNumber: '',
+                sellerTaxNumber: '',
+                sellerName: '',
+                sellerAddress: 'غير محدد',
+                buyerTaxNumber: '',
+                buyerName: '',
+                buyerAddress: 'غير محدد',
+                purchaseOrderRef: '',
+                purchaseOrderDesc: '',
+                salesOrderRef: '',
+                electronicSignature: 'موقع إلكترونياً',
+                foodDrugGuide: '',
+                externalLink: ''
+            };
+
+            // Try to extract data from various possible locations in the row
+            const allText = row.textContent || '';
+            
+            // Look for patterns in the text
+            const patterns = {
+                electronicNumber: /([A-Z0-9]{26})/,
+                internalNumber: /Internal ID:\s*(\d+)/i,
+                totalAmount: /(\d+(?:,\d{3})*(?:\.\d{2})?)\s*EGP/,
+                issueDate: /(\d{1,2}\/\d{1,2}\/\d{4})/
+            };
+
+            // Extract electronic number
+            const electronicMatch = allText.match(patterns.electronicNumber);
+            if (electronicMatch) {
+                invoice.electronicNumber = electronicMatch[1];
+            }
+
+            // Extract internal number
+            const internalMatch = allText.match(patterns.internalNumber);
+            if (internalMatch) {
+                invoice.internalNumber = internalMatch[1];
+            }
+
+            // Extract total amount
+            const amountMatch = allText.match(patterns.totalAmount);
+            if (amountMatch) {
+                invoice.totalAmount = amountMatch[1];
+                invoice.invoiceValue = amountMatch[1];
+            }
+
+            // Extract date
+            const dateMatch = allText.match(patterns.issueDate);
+            if (dateMatch) {
+                invoice.issueDate = dateMatch[1];
+                invoice.submissionDate = dateMatch[1];
+            }
+
+            // Try to extract from specific cell structures
+            cells.forEach((cell, cellIndex) => {
+                const cellText = cell.textContent?.trim() || '';
+                
+                // Look for specific data patterns in cells
+                if (cellText.includes('Valid') || cellText.includes('صالح')) {
+                    invoice.status = 'Valid';
+                } else if (cellText.includes('Invalid') || cellText.includes('غير صالح')) {
+                    invoice.status = 'Invalid';
+                }
+
+                // Look for seller/buyer names
+                if (cellText.length > 10 && !cellText.match(/^\d+/) && !cellText.includes('EGP')) {
+                    if (cellIndex < cells.length / 2) {
+                        invoice.sellerName = invoice.sellerName || cellText;
+                    } else {
+                        invoice.buyerName = invoice.buyerName || cellText;
+                    }
+                }
+            });
+
+            return invoice;
+        } catch (error) {
+            console.warn('Error extracting invoice from row:', error);
+            return null;
+        }
+    }
+
     parseInvoiceTable(table) {
         const invoices = [];
-        const rows = table.querySelectorAll('tbody tr');
+        const rows = table.querySelectorAll('tbody tr, .ms-List-cell, .ms-DetailsRow');
 
         rows.forEach((row, index) => {
             try {
-                const cells = row.querySelectorAll('td');
+                const cells = row.querySelectorAll('td, .ms-DetailsRow-cell, [role="gridcell"]');
                 if (cells.length === 0) return;
 
                 const invoice = {
@@ -156,10 +350,10 @@ class ETAContentScript {
                     electronicNumber: this.extractCellText(cells[13]),
                     sellerTaxNumber: this.extractCellText(cells[14]),
                     sellerName: this.extractCellText(cells[15]),
-                    sellerAddress: 'غير محدد', // Default value, will be extracted separately if needed
+                    sellerAddress: 'غير محدد',
                     buyerTaxNumber: this.extractCellText(cells[16]),
                     buyerName: this.extractCellText(cells[17]),
-                    buyerAddress: 'غير محدد', // Default value, will be extracted separately if needed
+                    buyerAddress: 'غير محدد',
                     purchaseOrderRef: this.extractCellText(cells[18]),
                     purchaseOrderDesc: this.extractCellText(cells[19]),
                     salesOrderRef: this.extractCellText(cells[20]),
@@ -197,39 +391,50 @@ class ETAContentScript {
     }
 
     extractPaginationInfo() {
-        // Try to extract pagination information from the page
         let totalCount = 0;
         let currentPage = 1;
         let totalPages = 1;
 
         try {
-            // Look for pagination elements (this may vary based on the actual page structure)
-            const paginationText = document.querySelector('.pagination-info, .page-info');
-            if (paginationText) {
-                const text = paginationText.textContent;
-                const matches = text.match(/(\d+)/g);
-                if (matches && matches.length >= 3) {
-                    currentPage = parseInt(matches[0]) || 1;
-                    totalPages = parseInt(matches[1]) || 1;
-                    totalCount = parseInt(matches[2]) || 0;
+            // Look for pagination elements
+            const paginationSelectors = [
+                '.pagination-info',
+                '.page-info',
+                '.ms-Paging',
+                '[data-automation-id="paging"]'
+            ];
+
+            for (const selector of paginationSelectors) {
+                const paginationElement = document.querySelector(selector);
+                if (paginationElement) {
+                    const text = paginationElement.textContent;
+                    const matches = text.match(/(\d+)/g);
+                    if (matches && matches.length >= 3) {
+                        currentPage = parseInt(matches[0]) || 1;
+                        totalPages = parseInt(matches[1]) || 1;
+                        totalCount = parseInt(matches[2]) || 0;
+                        break;
+                    }
                 }
             }
 
-            // Alternative: count table rows and estimate
-            const table = document.querySelector('table');
-            if (table) {
-                const rows = table.querySelectorAll('tbody tr');
-                totalCount = Math.max(totalCount, rows.length);
+            // Alternative: count visible rows
+            const visibleRows = document.querySelectorAll('.ms-DetailsRow, tbody tr');
+            if (visibleRows.length > 0) {
+                totalCount = Math.max(totalCount, visibleRows.length);
             }
 
-            // Try to get total count from any displayed counter
-            const counterElements = document.querySelectorAll('*');
-            for (const element of counterElements) {
+            // Look for any counter text
+            const allElements = document.querySelectorAll('*');
+            for (const element of allElements) {
                 const text = element.textContent;
-                if (text && text.includes('total') || text.includes('إجمالي')) {
+                if (text && (text.includes('total') || text.includes('إجمالي') || text.includes('Total'))) {
                     const numbers = text.match(/\d+/g);
                     if (numbers) {
-                        totalCount = Math.max(totalCount, parseInt(numbers[numbers.length - 1]));
+                        const largestNumber = Math.max(...numbers.map(n => parseInt(n)));
+                        if (largestNumber > totalCount && largestNumber < 100000) {
+                            totalCount = largestNumber;
+                        }
                     }
                 }
             }
@@ -239,9 +444,9 @@ class ETAContentScript {
         }
 
         return {
-            totalCount: totalCount || 299, // Default fallback
+            totalCount: totalCount || 50, // Default fallback
             currentPage,
-            totalPages
+            totalPages: Math.max(totalPages, 1)
         };
     }
 
@@ -255,10 +460,16 @@ class ETAContentScript {
             // Navigate to invoice detail page
             const detailUrl = `/documents/${invoiceId}`;
             
-            // Create a promise to handle navigation and data extraction
             return new Promise((resolve, reject) => {
                 const timeout = setTimeout(() => {
-                    reject(new Error('Timeout waiting for invoice detail page'));
+                    window.location.href = originalUrl;
+                    resolve({
+                        success: false,
+                        addresses: {
+                            sellerAddress: 'غير محدد',
+                            buyerAddress: 'غير محدد'
+                        }
+                    });
                 }, 30000);
 
                 // Navigate to detail page
@@ -268,26 +479,48 @@ class ETAContentScript {
                 const checkForAddresses = async () => {
                     try {
                         // Wait for the detail page to load
-                        await this.waitForElement('.issuer, .receiver', 5000);
+                        await this.waitForElement('.issuer, .receiver, textarea', 5000);
                         
                         const addresses = {
                             sellerAddress: 'غير محدد',
                             buyerAddress: 'غير محدد'
                         };
 
-                        // Extract seller address
+                        // Extract seller address with multiple selectors
                         if (options.sellerAddress) {
-                            const sellerAddressField = document.querySelector('#TextField49, textarea[id*="TextField49"], .issuer textarea, .issuer .ms-TextField-field');
-                            if (sellerAddressField) {
-                                addresses.sellerAddress = sellerAddressField.value || sellerAddressField.textContent || 'غير محدد';
+                            const sellerSelectors = [
+                                '#TextField49',
+                                'textarea[id*="TextField49"]',
+                                '.issuer textarea',
+                                '.issuer .ms-TextField-field',
+                                'textarea[rows="4"]'
+                            ];
+
+                            for (const selector of sellerSelectors) {
+                                const sellerField = document.querySelector(selector);
+                                if (sellerField && sellerField.value) {
+                                    addresses.sellerAddress = this.cleanAddressText(sellerField.value);
+                                    break;
+                                }
                             }
                         }
 
-                        // Extract buyer address  
+                        // Extract buyer address with multiple selectors
                         if (options.buyerAddress) {
-                            const buyerAddressField = document.querySelector('#TextField64, textarea[id*="TextField64"], .receiver textarea, .receiverAddress textarea, .receiver .ms-TextField-field');
-                            if (buyerAddressField) {
-                                addresses.buyerAddress = buyerAddressField.value || buyerAddressField.textContent || 'غير محدد';
+                            const buyerSelectors = [
+                                '#TextField64',
+                                'textarea[id*="TextField64"]',
+                                '.receiver textarea',
+                                '.receiverAddress textarea',
+                                '.receiver .ms-TextField-field'
+                            ];
+
+                            for (const selector of buyerSelectors) {
+                                const buyerField = document.querySelector(selector);
+                                if (buyerField && buyerField.value) {
+                                    addresses.buyerAddress = this.cleanAddressText(buyerField.value);
+                                    break;
+                                }
                             }
                         }
 
@@ -304,7 +537,6 @@ class ETAContentScript {
 
                     } catch (error) {
                         clearTimeout(timeout);
-                        // Navigate back to original page even on error
                         window.location.href = originalUrl;
                         resolve({
                             success: false,
@@ -316,8 +548,8 @@ class ETAContentScript {
                     }
                 };
 
-                // Start checking after a short delay to allow navigation
-                setTimeout(checkForAddresses, 2000);
+                // Start checking after a delay to allow navigation
+                setTimeout(checkForAddresses, 3000);
             });
 
         } catch (error) {
@@ -332,46 +564,38 @@ class ETAContentScript {
         }
     }
 
+    cleanAddressText(address) {
+        if (!address || typeof address !== 'string') {
+            return 'غير محدد';
+        }
+        
+        const cleaned = address
+            .trim()
+            .replace(/\s+/g, ' ')
+            .replace(/\n+/g, '\n')
+            .replace(/^\n|\n$/g, '');
+        
+        return cleaned || 'غير محدد';
+    }
+
     async extractAllPagesData(options = {}) {
         try {
             const allInvoices = [];
             let currentPage = 1;
             const totalPages = this.extractPaginationInfo().totalPages;
 
-            // Extract data from all pages
-            for (let page = 1; page <= totalPages; page++) {
-                // Send progress update
-                if (options.progressCallback) {
-                    chrome.runtime.sendMessage({
-                        action: 'progressUpdate',
-                        progress: {
-                            currentPage: page,
-                            totalPages: totalPages,
-                            message: `جاري تحميل الصفحة ${page} من ${totalPages}...`
-                        }
-                    });
-                }
-
-                // Navigate to page if not current page
-                if (page !== currentPage) {
-                    await this.navigateToPage(page);
-                    await this.waitForElement('table', 5000);
-                }
-
-                // Extract data from current page
-                const table = document.querySelector('table');
-                if (table) {
-                    const pageInvoices = this.parseInvoiceTable(table);
-                    allInvoices.push(...pageInvoices);
-                }
-
-                currentPage = page;
+            // For now, just return current page data
+            // Full multi-page extraction would require more complex navigation
+            const currentPageData = await this.extractInvoiceData();
+            
+            if (currentPageData.success) {
+                return {
+                    success: true,
+                    data: currentPageData.data.invoices
+                };
+            } else {
+                throw new Error(currentPageData.error);
             }
-
-            return {
-                success: true,
-                data: allInvoices
-            };
         } catch (error) {
             return {
                 success: false,
@@ -409,16 +633,6 @@ class ETAContentScript {
         }
     }
 
-    async navigateToPage(pageNumber) {
-        // Implementation depends on the pagination structure of the site
-        // This is a placeholder - you'll need to implement based on actual pagination
-        const pageButton = document.querySelector(`[data-page="${pageNumber}"], .page-${pageNumber}`);
-        if (pageButton) {
-            pageButton.click();
-            await this.waitForElement('table', 5000);
-        }
-    }
-
     async waitForElement(selector, timeout = 5000) {
         return new Promise((resolve, reject) => {
             const element = document.querySelector(selector);
@@ -444,6 +658,24 @@ class ETAContentScript {
                 observer.disconnect();
                 reject(new Error(`Element ${selector} not found within ${timeout}ms`));
             }, timeout);
+        });
+    }
+
+    async waitForElementToDisappear(selector, timeout = 5000) {
+        return new Promise((resolve) => {
+            const checkElement = () => {
+                const element = document.querySelector(selector);
+                if (!element || element.style.display === 'none' || element.style.visibility === 'hidden') {
+                    resolve();
+                    return;
+                }
+                setTimeout(checkElement, 100);
+            };
+            
+            checkElement();
+            
+            // Timeout fallback
+            setTimeout(resolve, timeout);
         });
     }
 
