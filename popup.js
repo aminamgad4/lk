@@ -366,44 +366,75 @@ class ETAInvoiceExporter {
   
   async loadInvoiceAddresses(invoices, tabId, options) {
     const invoicesWithAddresses = [];
+    let successCount = 0;
+    let failCount = 0;
     
     for (let i = 0; i < invoices.length; i++) {
       const invoice = invoices[i];
-      this.showStatus(`جاري استخراج عناوين الفاتورة ${i + 1} من ${invoices.length}...`, 'loading');
+      this.showStatus(`جاري استخراج عناوين الفاتورة ${i + 1} من ${invoices.length} (نجح: ${successCount}, فشل: ${failCount})...`, 'loading');
       
       try {
-        // Send message to extract addresses for this invoice
+        // Only extract addresses if electronic number exists
+        if (!invoice.electronicNumber || invoice.electronicNumber.trim() === '') {
+          console.warn(`No electronic number for invoice ${i + 1}`);
+          invoicesWithAddresses.push(invoice);
+          failCount++;
+          continue;
+        }
+
+        // Send message to extract addresses for this invoice with longer timeout
         const addressResponse = await this.sendMessageWithRetry(tabId, {
           action: 'extractAddressesForInvoice',
-          invoiceId: invoice.electronicNumber,
+          invoiceId: invoice.electronicNumber.trim(),
           options: options
-        });
+        }, 5); // Increase retry count for address extraction
         
         if (addressResponse && addressResponse.success) {
           const updatedInvoice = { ...invoice };
           
           // Update addresses based on selected options
           if (options.sellerAddress) {
-            updatedInvoice.sellerAddress = addressResponse.addresses.sellerAddress || 'غير محدد';
+            updatedInvoice.sellerAddress = this.cleanAddressText(addressResponse.addresses.sellerAddress) || 'غير محدد';
           }
           if (options.buyerAddress) {
-            updatedInvoice.buyerAddress = addressResponse.addresses.buyerAddress || 'غير محدد';
+            updatedInvoice.buyerAddress = this.cleanAddressText(addressResponse.addresses.buyerAddress) || 'غير محدد';
           }
           
           invoicesWithAddresses.push(updatedInvoice);
+          successCount++;
         } else {
+          // Keep original invoice with default addresses
           invoicesWithAddresses.push(invoice);
+          failCount++;
         }
       } catch (error) {
         console.warn(`Failed to load addresses for invoice ${invoice.electronicNumber}:`, error);
+        // Keep original invoice with default addresses
         invoicesWithAddresses.push(invoice);
+        failCount++;
       }
       
-      // Small delay between requests
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Longer delay between requests to avoid overwhelming the server
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
     
+    this.showStatus(`تم استخراج العناوين: نجح ${successCount}، فشل ${failCount} من ${invoices.length}`, 'success');
     return invoicesWithAddresses;
+  }
+
+  cleanAddressText(address) {
+    if (!address || typeof address !== 'string') {
+      return 'غير محدد';
+    }
+    
+    // Clean up the address text
+    const cleaned = address
+      .trim()
+      .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+      .replace(/\n+/g, '\n') // Replace multiple newlines with single newline
+      .replace(/^\n|\n$/g, ''); // Remove leading/trailing newlines
+    
+    return cleaned || 'غير محدد';
   }
   
   async exportAllPages(format, options) {
